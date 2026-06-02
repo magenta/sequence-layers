@@ -1,6 +1,6 @@
 # Sequence Layers
 
-A neural network API and library (currently in Jax and TensorFlow 2) for easy
+A neural network API and library (in Jax, MLX, and TensorFlow 2) for easy
 creation of sequence models that can be executed both layer-by-layer (e.g.
 teacher forced training) and step-by-step (e.g. autoregressive sampling). It
 mitigates many common bugs arising in both streaming and parallel sequence
@@ -14,7 +14,9 @@ with our intro notebook:
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/google/sequence-layers/blob/main/notebooks/intro.ipynb)
 
 **Note:** Only Jax support is installed by default. Use
-`pip install sequence_layers[tensorflow]` for TensorFlow.
+`pip install sequence_layers[mlx]` for MLX and `pip install sequence_layers[tensorflow]` for TensorFlow.
+
+For MLX usage (inference on Apple Silicon), see the [MLX Backend Guide](docs/mlx_guide.md).
 
 **Disclaimer:** This is not an officially supported Google product.
 
