@@ -146,6 +146,7 @@ class DotProductSelfAttention(types.Emitting):
       value_network: types.SequenceLayer | None = None,
       attention_logits_soft_cap: float | None = None,
       num_sink_embeddings: int = 0,
+      use_sink_scalars: bool = False,
       input_projection=None,
   ):
     super().__init__()
@@ -224,6 +225,12 @@ class DotProductSelfAttention(types.Emitting):
       self.sink_key_embeddings = None
       self.sink_value_embeddings = None
 
+    # Attention sink scalars: a learned scalar per head added as an extra
+    # logit column in the softmax, with a zero-value sink position.
+    self.use_sink_scalars = use_sink_scalars
+    if use_sink_scalars:
+      self.sink_scalars = mx.zeros((num_heads,), dtype=param_dtype)
+
     self.query_network = query_network
     self.key_network = key_network
     self.value_network = value_network
@@ -287,9 +294,10 @@ class DotProductSelfAttention(types.Emitting):
     # Use mx.fast.scaled_dot_product_attention unless soft_cap forces
     # manual logit manipulation.
     has_soft_cap = getattr(self, '_attention_logits_soft_cap', None) is not None
+    has_sink_scalars = getattr(self, 'use_sink_scalars', False) and self.use_sink_scalars
 
-    if not has_soft_cap:
-      # SDPA path — handles both plain and sink cases.
+    if not has_soft_cap and not has_sink_scalars:
+      # SDPA path — handles both plain and sink-embedding cases.
       q = mx.transpose(queries, (0, 2, 1, 3))
       k = mx.transpose(keys, (0, 2, 1, 3))
       v = mx.transpose(values, (0, 2, 1, 3))
@@ -342,7 +350,7 @@ class DotProductSelfAttention(types.Emitting):
       )
       return mx.transpose(context, (0, 2, 1, 3))
 
-    # Manual path — only for attention_logits_soft_cap.
+    # Manual path — for attention_logits_soft_cap or sink_scalars.
     num_groups = self.num_heads // self.num_kv_heads
     if num_groups > 1:
       keys = mx.repeat(keys, num_groups, axis=2)
@@ -381,8 +389,32 @@ class DotProductSelfAttention(types.Emitting):
         )
         mask = mx.concatenate([sink_mask, mask], axis=-1)
 
-    cap = self._attention_logits_soft_cap
-    logits = mx.tanh(logits / cap) * cap
+    # Sink scalars: add a learned per-head scalar as an extra logit column,
+    # paired with a zero-value sink position.  Matches JAX behavior.
+    if has_sink_scalars:
+      # sink_scalars: [num_heads] -> [1, num_heads, 1, 1] -> [b, nh, qt, 1]
+      sink_logit = mx.broadcast_to(
+          self.sink_scalars.astype(logits.dtype)[None, :, None, None],
+          (logits.shape[0], self.num_heads, logits.shape[2], 1),
+      )
+      logits = mx.concatenate([sink_logit, logits], axis=-1)
+      # Zero-value sink: [b, nh, 1, uph]
+      sink_v_zeros = mx.zeros(
+          (v.shape[0], self.num_heads, 1, self.units_per_head),
+          dtype=v.dtype,
+      )
+      v = mx.concatenate([sink_v_zeros, v], axis=2)
+      # Extend mask — sink is always valid.
+      if mask is not None:
+        sink_mask = mx.ones(
+            (mask.shape[0], mask.shape[1], mask.shape[2], 1),
+            dtype=mx.bool_,
+        )
+        mask = mx.concatenate([sink_mask, mask], axis=-1)
+
+    if has_soft_cap:
+      cap = self._attention_logits_soft_cap
+      logits = mx.tanh(logits / cap) * cap
 
     if mask is not None:
       large_neg = mx.array(-1e9, dtype=logits.dtype)
@@ -759,6 +791,7 @@ class DeferredDotProductSelfAttention(types.Emitting):
         key_network=key_network,
         value_network=value_network,
         num_sink_embeddings=getattr(self._config, 'num_sink_embeddings', 0),
+        use_sink_scalars=getattr(self._config, 'use_sink_scalars', False),
         input_projection=getattr(self._config, 'input_projection', None),
     )
 
@@ -1264,6 +1297,7 @@ class StreamingDotProductAttention(types.Emitting):
       key_network: types.SequenceLayer | None = None,
       value_network: types.SequenceLayer | None = None,
       num_sink_embeddings: int = 0,
+      use_sink_scalars: bool = False,
       input_projection=None,
   ):
     super().__init__()
@@ -1330,6 +1364,12 @@ class StreamingDotProductAttention(types.Emitting):
       self.sink_key_embeddings = None
       self.sink_value_embeddings = None
 
+    # Attention sink scalars: a learned scalar per head added as an extra
+    # logit column in the softmax, with a zero-value sink position.
+    self.use_sink_scalars = use_sink_scalars
+    if use_sink_scalars:
+      self.sink_scalars = mx.zeros((num_heads,), dtype=param_dtype)
+
     self.query_network = query_network
     self.key_network = key_network
     self.value_network = value_network
@@ -1386,6 +1426,8 @@ class StreamingDotProductAttention(types.Emitting):
         q, self._per_dim_scale, self._query_scale, self.units_per_head
     )
 
+    has_sink_scalars = getattr(self, 'use_sink_scalars', False) and self.use_sink_scalars
+
     if self.sink_key_embeddings is not None:
       # JAX computes sink logits with *unscaled* queries.  Pre-divide
       # sink keys by the scale so that SDPA produces equivalent logits:
@@ -1416,6 +1458,41 @@ class StreamingDotProductAttention(types.Emitting):
             dtype=mx.bool_,
         )
         mask = mx.concatenate([sink_mask, mask], axis=-1)
+
+    if has_sink_scalars:
+      # Manual path for sink scalars — cannot use SDPA with constant logit.
+      logits = mx.matmul(q, mx.transpose(k, (0, 1, 3, 2)))
+
+      # Prepend the learned per-head sink scalar as an extra logit column.
+      sink_logit = mx.broadcast_to(
+          self.sink_scalars.astype(logits.dtype)[None, :, None, None],
+          (logits.shape[0], self.num_heads, logits.shape[2], 1),
+      )
+      logits = mx.concatenate([sink_logit, logits], axis=-1)
+
+      # Zero-value sink position.
+      sink_v_zeros = mx.zeros(
+          (v.shape[0], self.num_heads, 1, self.units_per_head),
+          dtype=v.dtype,
+      )
+      v = mx.concatenate([sink_v_zeros, v], axis=2)
+
+      # Extend mask — sink is always valid.
+      if mask is not None:
+        sink_mask = mx.ones(
+            (mask.shape[0], mask.shape[1], mask.shape[2], 1),
+            dtype=mx.bool_,
+        )
+        mask = mx.concatenate([sink_mask, mask], axis=-1)
+
+      if mask is not None:
+        large_neg = mx.array(-1e9, dtype=logits.dtype)
+        logits = mx.where(mask, logits, large_neg)
+
+      logits_f32 = logits.astype(mx.float32) if logits.dtype != mx.float32 else logits
+      weights = mx.softmax(logits_f32, axis=-1).astype(v.dtype)
+      context = mx.matmul(weights, v)
+      return mx.transpose(context, (0, 2, 1, 3))
 
     context = mx.fast.scaled_dot_product_attention(
         q, k, v, scale=1.0, mask=mask
@@ -1767,6 +1844,7 @@ class DeferredStreamingDotProductAttention(types.Emitting):
         key_network=key_network,
         value_network=value_network,
         num_sink_embeddings=getattr(self._config, 'num_sink_embeddings', 0),
+        use_sink_scalars=getattr(self._config, 'use_sink_scalars', False),
         input_projection=getattr(self._config, 'input_projection', None),
     )
 
@@ -1925,6 +2003,7 @@ class DeferredLocalDotProductSelfAttention(types.Emitting):
         key_network=key_network,
         value_network=value_network,
         num_sink_embeddings=getattr(self._config, 'num_sink_embeddings', 0),
+        use_sink_scalars=getattr(self._config, 'use_sink_scalars', False),
         input_projection=getattr(self._config, 'input_projection', None),
     )
 
