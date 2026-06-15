@@ -1939,7 +1939,7 @@ class LocalDotProductSelfAttention(DotProductSelfAttention):
 
   @property
   def block_size(self):
-    return self._block_size_config
+    return 1
 
   @classmethod
   def from_config(cls, config):
@@ -2015,7 +2015,7 @@ class DeferredLocalDotProductSelfAttention(types.Emitting):
 
   @property
   def block_size(self):
-    return self._config.block_size
+    return 1
 
   @property
   def input_latency(self):
