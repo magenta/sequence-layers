@@ -853,7 +853,7 @@ class Lambda(types.Stateless):
     fn: Callable = None
     sequence_input: bool = False
     mask_required: bool = True
-    # Accepted for JAX compatibility but ignored by MLX Lambda.
+    # Used to guide shape/dtype probing (e.g. for bitcasting operations).
     expected_input_spec: object = None
     expected_output_spec: object = None
     name: str | None = None
@@ -862,12 +862,13 @@ class Lambda(types.Stateless):
       return Lambda.from_config(self)
 
   def __init__(self, fn, *, sequence_input=False, mask_required=True,
-               expected_output_spec=None):
+               expected_output_spec=None, expected_input_spec=None):
     super().__init__()
     self._fn = fn
     self._sequence_input = sequence_input
     self._mask_required = mask_required
     self._expected_output_spec = expected_output_spec
+    self._expected_input_spec = expected_input_spec
     self._cached_output_spec = None
 
   def _probe_output(self, input_shape, input_dtype):
@@ -877,7 +878,17 @@ class Lambda(types.Stateless):
     if self._cached_output_spec is not None:
       return self._cached_output_spec
     try:
-      dummy_values = mx.zeros((1, 1) + tuple(input_shape), dtype=input_dtype)
+      probe_shape = tuple(input_shape)
+      probe_dtype = input_dtype
+      if self._expected_input_spec is not None:
+        probe_shape = tuple(self._expected_input_spec.shape)
+        try:
+          from sequence_layers.mlx.init_mapping import _to_mx_dtype
+          probe_dtype = _to_mx_dtype(self._expected_input_spec.dtype)
+        except Exception:
+          probe_dtype = self._expected_input_spec.dtype
+
+      dummy_values = mx.zeros((1, 1) + probe_shape, dtype=probe_dtype)
       dummy_mask = mx.ones((1, 1), dtype=mx.bool_)
       if self._sequence_input:
         result = self._fn(Sequence(dummy_values, dummy_mask))
@@ -927,6 +938,7 @@ class Lambda(types.Stateless):
         sequence_input=config.sequence_input,
         mask_required=config.mask_required,
         expected_output_spec=getattr(config, 'expected_output_spec', None),
+        expected_input_spec=getattr(config, 'expected_input_spec', None),
     )
 
 
